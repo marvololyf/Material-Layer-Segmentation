@@ -22,3 +22,9 @@ env/
 prediction_result.png
 thickness_report_*
 *.log
+
+# 数据集与本地测试图片文件夹（忽略整个目录）
+data/
+outputs/
+results/
+temp/
