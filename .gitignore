@@ -1,0 +1,24 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch 训练权重（建议单独放外链，不要直接上传 Git 仓库）
+*.pth
+*.pt
+*.onnx
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE 与系统文件
+.vscode/
+.idea/
+.DS_Store
+
+# 临时生成的文件与测试结果
+prediction_result.png
+thickness_report_*
+*.log
