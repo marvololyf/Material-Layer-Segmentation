@@ -42,16 +42,15 @@
 git clone https://github.com/你的用户名/Material-Layer-Segmentation.git
 cd Material-Layer-Segmentation
 pip install -r requirements.txt
+```
 
 2. 安装 OCR 依赖 (Tesseract-OCR)
-系统需要 Tesseract OCR 支持以识别比例尺数字：
+系统需要 Tesseract OCR 支持以自动识别比例尺数字：
 
-Windows: 下载并安装 Tesseract-OCR，并在 config.json 中配置安装路径或添加到环境变量中。
+Windows: 下载并安装 Tesseract-OCR，并在 config.json 中配置安装路径（例如 E:/Program Files/Tesseract-OCR/tesseract.exe）。
 Linux: sudo apt-get install tesseract-ocr
 3. 模型权重下载
-请将训练好的 best_unet_model_v3.pth 权重文件下载并放置于项目根目录下：
-
-此处下载模型权重 ：
+请将训练好的 best_unet_model_v3.pth 权重文件下载并放置于项目根目录或 models/ 目录下：
 
 通过网盘分享的文件：best_unet_model_v3.pth
 链接: https://pan.baidu.com/s/1UYqfJemuSsgk5VraM0InUQ?pwd=vs4q 提取码: vs4q
