@@ -22,6 +22,8 @@ env/
 prediction_result.png
 thickness_report_*
 *.log
+# 忽略所有 PDF
+*.pdf
 
 # 数据集与本地测试图片文件夹（忽略整个目录）
 data/
