@@ -59,6 +59,14 @@ THICKNESS_SAMPLE_COUNT = CONFIG["settings"].get("thickness_sample_count", 50)
 SCALE_ROI_LEFT_RATIO = CONFIG["settings"].get("scale_roi_left_ratio", 0.7)
 SCALE_ROI_TOP_RATIO = CONFIG["settings"].get("scale_roi_top_ratio", 0.8)
 
+# OCR 调试输出目录
+OCR_DEBUG_ROOT = os.path.join(PROJECT_ROOT, "ocr_debug")
+
+# 是否保存比例尺 OCR 的裁剪图、预处理图和原始识别结果
+OCR_DEBUG_ENABLED = CONFIG["settings"].get(
+    "ocr_debug_enabled",
+    True,
+)
 
 def get_tesseract_cmd():
     config_cmd = CONFIG["paths"].get("tesseract_cmd", "")
@@ -88,6 +96,14 @@ CLASS_NAMES = {
     3: "基体层",
 }
 
+# 高对比度 Mask 叠加颜色 (RGB)
+MASK_COLORS = {
+    0: (120, 120, 120),  # 树脂层: 暗灰色
+    1: (255, 185, 0),    # 陶瓷层: 鲜黄色 (第1层)
+    2: (0, 200, 220),    # 粘结层: 鲜青色 (第2层)
+    3: (190, 60, 220),   # 基体层: 高亮紫色/品红 (第3层 - 明显醒目)
+}
+
 BOUNDARY_NAMES = {
     "resin_ceramic": "树脂/陶瓷分界",
     "ceramic_bonding": "陶瓷/粘结分界",
@@ -95,9 +111,9 @@ BOUNDARY_NAMES = {
 }
 
 BOUNDARY_COLORS = {
-    "resin_ceramic": (255, 40, 40),
-    "ceramic_bonding": (40, 220, 40),
-    "bonding_substrate": (40, 120, 255),
+    "resin_ceramic": (255, 40, 40),      # 红色划线
+    "ceramic_bonding": (40, 220, 40),    # 绿色划线
+    "bonding_substrate": (40, 120, 255),  # 蓝色划线
 }
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -106,7 +122,7 @@ STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 CONTENT_DARK_THRESHOLD = 18
 CONTENT_MIN_AREA_RATIO = 0.20
 CONTENT_INNER_MARGIN = 4
-EDGE_COLUMN_IGNORE_RATIO = 0.025  # 忽略两侧 2.5% 的边缘区域以避开伪影
+EDGE_COLUMN_IGNORE_RATIO = 0.015
 
 MIN_COMPONENT_AREA = 80
 MIN_COMPONENT_WIDTH_RATIO = 0.015
@@ -120,38 +136,12 @@ MIN_BOUNDARY_GAP = 4
 
 PORE_MIN_COMPONENT_AREA = 6
 
-MIN_CLASS_PIXELS_IN_ROI = 150
-MIN_CLASS_COLUMN_RATIO = 0.10
-
-
-CLASS_MAP = {
-    "resin": 0,      
-    "ceramic": 1,    
-    "bonding": 2,    
-    "substrate": 3,  
-}
 
 def get_mode_class_map(mode):
     if mode == "four_layer":
-        return {
-            "resin": 0,
-            "ceramic": 1,
-            "bonding": 2,
-            "substrate": 3,
-        }
-    if mode == "three_layer":
-        return {
-            "resin": None,
-            "ceramic": 1,
-            "bonding": 2,
-            "substrate": 3,
-        }
-    return {
-        "resin": None,
-        "ceramic": None,
-        "bonding": None,
-        "substrate": None,
-    }
+        return {"resin": 0, "ceramic": 1, "bonding": 2, "substrate": 3}
+    else:
+        return {"resin": None, "ceramic": 1, "bonding": 2, "substrate": 3}
 
 
 class DoubleConv(nn.Module):
@@ -232,16 +222,14 @@ def imwrite_rgb(path, rgb):
 
 
 def preprocess_image(image_rgb):
-    resized = cv2.resize(
-        image_rgb,
-        (INPUT_WIDTH, INPUT_HEIGHT),
-        interpolation=cv2.INTER_LINEAR,
-    )
+    resized = cv2.resize(image_rgb, (INPUT_WIDTH, INPUT_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
+    # --- 同步加入 CLAHE，保证预测端与训练端图像特征 100% 对齐 ---
     gray_lab = cv2.cvtColor(resized, cv2.COLOR_RGB2LAB)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     gray_lab[:, :, 0] = clahe.apply(gray_lab[:, :, 0])
     resized = cv2.cvtColor(gray_lab, cv2.COLOR_LAB2RGB)
+    # -------------------------------------------------------------
 
     image = resized.astype(np.float32) / 255.0
     image = (image - MEAN) / STD
@@ -251,41 +239,17 @@ def preprocess_image(image_rgb):
 
 def load_model():
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"找不到模型权重：\n{MODEL_PATH}"
-        )
+        raise FileNotFoundError(f"找不到模型权重：\n{MODEL_PATH}")
 
     state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
     if isinstance(state_dict, dict) and "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
-    state_dict = {
-        key.replace("module.", ""): value
-        for key, value in state_dict.items()
-    }
+    state_dict = {key.replace("module.", ""): value for key, value in state_dict.items()}
 
     model = ResNet34UNet(num_classes=NUM_CLASSES).to(DEVICE)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
-
-
-def clean_mask_border_artifacts(pred_mask, margin_ratio=0.025):
-    """
-    清洗神经网络在图像最左侧和最右侧边缘产生的狭窄垂直伪影条带
-    """
-    h, w = pred_mask.shape
-    margin = max(4, int(w * margin_ratio))
-    cleaned = pred_mask.copy()
-
-    valid_left_col = cleaned[:, margin].copy()
-    for col in range(margin):
-        cleaned[:, col] = valid_left_col
-
-    valid_right_col = cleaned[:, w - 1 - margin].copy()
-    for col in range(w - margin, w):
-        cleaned[:, col] = valid_right_col
-
-    return cleaned
 
 
 @torch.no_grad()
@@ -296,22 +260,19 @@ def predict_outputs(model, image_rgb):
     probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.float32)
     pred = np.argmax(probs, axis=0).astype(np.uint8)
 
-    pred = cv2.resize(
-        pred,
-        (original_w, original_h),
-        interpolation=cv2.INTER_NEAREST,
-    )
+    pred = cv2.resize(pred, (original_w, original_h), interpolation=cv2.INTER_NEAREST)
+    return pred
 
-    pred = clean_mask_border_artifacts(pred, EDGE_COLUMN_IGNORE_RATIO)
 
-    resized_probs = np.zeros((NUM_CLASSES, original_h, original_w), dtype=np.float32)
-    for class_id in range(NUM_CLASSES):
-        resized_probs[class_id] = cv2.resize(
-            probs[class_id],
-            (original_w, original_h),
-            interpolation=cv2.INTER_LINEAR,
-        )
-    return pred, resized_probs
+def overlay_segmentation_mask(image_rgb, pred_mask, alpha=0.35):
+    h, w = pred_mask.shape
+    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+
+    for class_id, color in MASK_COLORS.items():
+        color_mask[pred_mask == class_id] = color
+
+    overlayed = cv2.addWeighted(image_rgb, 1.0 - alpha, color_mask, alpha, 0)
+    return overlayed
 
 
 def ensure_odd(value, minimum=3):
@@ -355,11 +316,7 @@ def detect_content_roi(image_rgb):
     mask = (gray > CONTENT_DARK_THRESHOLD).astype(np.uint8)
     kernel = np.ones((9, 9), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return 0, 0, w, h
 
@@ -377,12 +334,27 @@ def detect_content_roi(image_rgb):
     return x0, y0, x1, y1
 
 
+def get_scale_exclusion_roi(image_rgb):
+    h, w = image_rgb.shape[:2]
+    x0 = int(round(w * float(SCALE_ROI_LEFT_RATIO)))
+    y0 = int(round(h * float(SCALE_ROI_TOP_RATIO)))
+    return max(0, min(w, x0)), max(0, min(h, y0)), w, h
+
+
+def mask_out_scale_region(pred_mask, image_rgb):
+    masked = pred_mask.copy()
+    x0, y0, x1, y1 = get_scale_exclusion_roi(image_rgb)
+    invalid_class_id = np.uint8(min(255, NUM_CLASSES))
+    masked[y0:y1, x0:x1] = invalid_class_id
+    return masked
+
+
 def get_valid_x_range(width, roi=None):
     if roi is None:
         x0, x1 = 0, width
     else:
         x0, _, x1, _ = roi
-    margin = max(4, int(width * EDGE_COLUMN_IGNORE_RATIO))
+    margin = max(2, int(width * EDGE_COLUMN_IGNORE_RATIO))
     x0 = min(width - 1, max(0, x0 + margin))
     x1 = max(x0 + 1, min(width, x1 - margin))
     return x0, x1
@@ -434,21 +406,20 @@ def curve_from_layer_top(pred_mask, class_id, roi=None):
         return None
 
     h, w = pred_mask.shape
+    
+    # 抽取边界前先对二值 Mask 清理形态学噪点
+    cleaned_binary = clean_layer_mask(pred_mask == class_id)
+    
     x0, x1 = get_valid_x_range(w, roi)
     y0 = 0
     y1 = h
     if roi is not None:
         _, y0, _, y1 = roi
 
-    binary_class = (pred_mask[y0:y1, x0:x1] == class_id).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary_cleaned = cv2.morphologyEx(binary_class, cv2.MORPH_OPEN, kernel)
-
     xs = []
     ys = []
-    for rel_x in range(binary_cleaned.shape[1]):
-        x = x0 + rel_x
-        col = np.where(binary_cleaned[:, rel_x] > 0)[0]
+    for x in range(x0, x1):
+        col = np.where(cleaned_binary[y0:y1, x] > 0)[0]
         if col.size > 0:
             xs.append(x)
             ys.append(y0 + int(col.min()))
@@ -457,19 +428,9 @@ def curve_from_layer_top(pred_mask, class_id, roi=None):
     if len(xs) < min_columns:
         return None
 
+    curve = np.full(w, np.nan, dtype=np.float32)
     xs = np.asarray(xs, dtype=np.int32)
     ys = np.asarray(ys, dtype=np.float32)
-
-    if len(ys) > 10:
-        med_ys = median_filter_1d(ys, kernel_size=15)
-        valid_mask = np.abs(ys - med_ys) < 18.0
-        xs = xs[valid_mask]
-        ys = ys[valid_mask]
-
-    if len(xs) < min_columns:
-        return None
-
-    curve = np.full(w, np.nan, dtype=np.float32)
     curve[xs] = ys
 
     valid = np.where(np.isfinite(curve))[0]
@@ -492,61 +453,16 @@ def curve_from_layer_top(pred_mask, class_id, roi=None):
     return np.clip(curve, 0, h - 1)
 
 
-def boundary_valid(curve, width):
-    if curve is None:
-        return False
-    finite = np.isfinite(curve)
-    if finite.sum() < max(BOUNDARY_MIN_COLUMNS_ABS, int(width * BOUNDARY_MIN_COLUMNS_RATIO)):
-        return False
-    return True
-
-
 def classify_mode(pred_mask, image_rgb, roi):
-    x0, y0, x1, y1 = roi
-    
-    vx0, vx1 = get_valid_x_range(pred_mask.shape[1], roi)
-    h_roi = y1 - y0
+    h, w = pred_mask.shape
+    top_region = pred_mask[0:int(h * 0.3), :]
+    resin_pixel_count = np.sum(top_region == 0)
+    total_top_pixels = top_region.size
 
-    top_region = pred_mask[y0 : y0 + int(h_roi * 0.20), vx0:vx1]
-    resin_pixels = np.sum(top_region == 0)
-    resin_ratio = resin_pixels / top_region.size
-
-    if resin_ratio < 0.015:
-        return "three_layer"
-
-    four_map = get_mode_class_map("four_layer")
-    three_map = get_mode_class_map("three_layer")
-
-    four_rc = curve_from_layer_top(pred_mask, four_map["ceramic"], roi=roi)
-    four_cb = curve_from_layer_top(pred_mask, four_map["bonding"], roi=roi)
-    four_bs = curve_from_layer_top(pred_mask, four_map["substrate"], roi=roi)
-
-    three_cb = curve_from_layer_top(pred_mask, three_map["bonding"], roi=roi)
-    three_bs = curve_from_layer_top(pred_mask, three_map["substrate"], roi=roi)
-
-    four_ok = (
-        boundary_valid(four_rc, pred_mask.shape[1])
-        and boundary_valid(four_cb, pred_mask.shape[1])
-        and boundary_valid(four_bs, pred_mask.shape[1])
-    )
-    three_ok = (
-        boundary_valid(three_cb, pred_mask.shape[1])
-        and boundary_valid(three_bs, pred_mask.shape[1])
-    )
-
-    if four_ok and not three_ok:
+    if (resin_pixel_count / total_top_pixels) > 0.03:
         return "four_layer"
-    if three_ok and not four_ok:
+    else:
         return "three_layer"
-
-    if four_ok and three_ok:
-        xs = np.arange(vx0, vx1)
-        four_red_gap = np.nanmedian(four_cb[xs] - four_rc[xs])
-        if np.isfinite(four_red_gap) and four_red_gap > 10:
-            return "four_layer"
-        return "three_layer"
-
-    return "unknown"
 
 
 def enforce_boundary_order(boundary_curves, height):
@@ -574,23 +490,19 @@ def build_boundary_curves(pred_mask, image_rgb, roi=None):
     mode = classify_mode(pred_mask, image_rgb, roi)
     class_map = get_mode_class_map(mode)
 
+    analysis_mask = mask_out_scale_region(pred_mask, image_rgb)
+
     if mode == "four_layer":
         boundary_curves = {
-            "resin_ceramic": curve_from_layer_top(pred_mask, class_map["ceramic"], roi=roi),
-            "ceramic_bonding": curve_from_layer_top(pred_mask, class_map["bonding"], roi=roi),
-            "bonding_substrate": curve_from_layer_top(pred_mask, class_map["substrate"], roi=roi),
-        }
-    elif mode == "three_layer":
-        boundary_curves = {
-            "resin_ceramic": None,
-            "ceramic_bonding": curve_from_layer_top(pred_mask, class_map["bonding"], roi=roi),
-            "bonding_substrate": curve_from_layer_top(pred_mask, class_map["substrate"], roi=roi),
+            "resin_ceramic": curve_from_layer_top(analysis_mask, class_map["ceramic"], roi=roi),
+            "ceramic_bonding": curve_from_layer_top(analysis_mask, class_map["bonding"], roi=roi),
+            "bonding_substrate": curve_from_layer_top(analysis_mask, class_map["substrate"], roi=roi),
         }
     else:
         boundary_curves = {
             "resin_ceramic": None,
-            "ceramic_bonding": None,
-            "bonding_substrate": None,
+            "ceramic_bonding": curve_from_layer_top(analysis_mask, class_map["bonding"], roi=roi),
+            "bonding_substrate": curve_from_layer_top(analysis_mask, class_map["substrate"], roi=roi),
         }
 
     return enforce_boundary_order(boundary_curves, h), mode, class_map
@@ -629,6 +541,17 @@ def draw_one_boundary(result, curve, boundary_key, thickness):
         2,
         cv2.LINE_AA,
     )
+
+
+def draw_boundary_lines_on_image(base_rgb, boundary_curves, line_thickness=4):
+    result = base_rgb.copy()
+    found = False
+    for boundary_key in ("resin_ceramic", "ceramic_bonding", "bonding_substrate"):
+        curve = boundary_curves.get(boundary_key)
+        if curve is not None:
+            draw_one_boundary(result, curve, boundary_key, int(line_thickness))
+            found = True
+    return result, found
 
 
 def build_layer_band_mask(pred_mask, boundary_curves, layer_key, class_map):
@@ -671,11 +594,7 @@ def build_layer_band_mask(pred_mask, boundary_curves, layer_key, class_map):
 
 
 def get_porosity_target_layer(mode):
-    if mode == "four_layer":
-        return "ceramic"    # 4层图计算陶瓷层孔隙率
-    if mode == "three_layer":
-        return "bonding"    # 3层图计算粘结层孔隙率
-    return None
+    return "ceramic"
 
 
 def detect_particles_and_pores(image_rgb, target_mask):
@@ -697,11 +616,7 @@ def detect_particles_and_pores(image_rgb, target_mask):
         kernel_size += 1
     kernel_size = max(51, kernel_size)
 
-    bg_illumination = cv2.GaussianBlur(
-        masked_gray,
-        (kernel_size, kernel_size),
-        0,
-    ).astype(np.float32)
+    bg_illumination = cv2.GaussianBlur(masked_gray, (kernel_size, kernel_size), 0).astype(np.float32)
     corrected = (gray.astype(np.float32) / (bg_illumination + 1e-5)) * mean_val
     corrected = np.clip(corrected, 0, 255).astype(np.uint8)
 
@@ -709,22 +624,13 @@ def detect_particles_and_pores(image_rgb, target_mask):
     if len(target_pixels) == 0:
         return {"pore_ratio": 0.0, "otsu_threshold": 0, "pore_mask": full_pore_mask}
 
-    thresh_val, _ = cv2.threshold(
-        target_pixels,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
+    thresh_val, _ = cv2.threshold(target_pixels, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     pore_in_target = (corrected < thresh_val) & target_indices
     full_pore_mask[pore_in_target] = 255
 
     clean_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    full_pore_mask = cv2.morphologyEx(
-        full_pore_mask,
-        cv2.MORPH_OPEN,
-        clean_kernel,
-    )
+    full_pore_mask = cv2.morphologyEx(full_pore_mask, cv2.MORPH_OPEN, clean_kernel)
 
     count, labels, stats, _ = cv2.connectedComponentsWithStats(full_pore_mask, 8)
     filtered = np.zeros_like(full_pore_mask)
@@ -736,17 +642,9 @@ def detect_particles_and_pores(image_rgb, target_mask):
 
     total_target_cnt = int(np.sum(target_indices))
     pore_cnt = int(np.sum(full_pore_mask > 0))
-    pore_ratio = (
-        float(pore_cnt / total_target_cnt * 100.0)
-        if total_target_cnt > 0
-        else 0.0
-    )
+    pore_ratio = float(pore_cnt / total_target_cnt * 100.0) if total_target_cnt > 0 else 0.0
 
-    return {
-        "pore_ratio": pore_ratio,
-        "otsu_threshold": int(thresh_val),
-        "pore_mask": full_pore_mask,
-    }
+    return {"pore_ratio": pore_ratio, "otsu_threshold": int(thresh_val), "pore_mask": full_pore_mask}
 
 
 def overlay_pore_mask(result_rgb, pore_mask, color=(255, 215, 0), alpha=0.45):
@@ -754,38 +652,19 @@ def overlay_pore_mask(result_rgb, pore_mask, color=(255, 215, 0), alpha=0.45):
         return result_rgb
     output = result_rgb.copy()
     indices = pore_mask > 0
-    output[indices] = (
-        (1 - alpha) * result_rgb[indices] + alpha * np.array(color, dtype=np.float32)
-    ).astype(np.uint8)
+    output[indices] = ((1 - alpha) * result_rgb[indices] + alpha * np.array(color, dtype=np.float32)).astype(np.uint8)
     return output
 
 
-def draw_boundary_lines(image_rgb, pred_mask, line_thickness=4):
-    result = image_rgb.copy()
-    roi = detect_content_roi(image_rgb)
-    boundary_curves, mode, class_map = build_boundary_curves(pred_mask, image_rgb, roi=roi)
-
-    if mode == "four_layer":
-        required = ("resin_ceramic", "ceramic_bonding", "bonding_substrate")
-    elif mode == "three_layer":
-        required = ("ceramic_bonding", "bonding_substrate")
-    else:
-        required = ()
-
-    found = False
-    for boundary_key in ("resin_ceramic", "ceramic_bonding", "bonding_substrate"):
-        curve = boundary_curves.get(boundary_key)
-        if curve is not None:
-            draw_one_boundary(result, curve, boundary_key, int(line_thickness))
-            found = True
-
-    if required and not all(boundary_curves.get(key) is not None for key in required):
-        found = False
-
-    return result, found, boundary_curves, roi, mode, class_map
-
-
 def run_tesseract_ocr(image, psm_values=(7, 8, 6, 11)):
+    """
+    使用多个 PSM 分别执行 OCR。
+
+    注意：
+    这里不能在第一个识别到数字后 break。
+    例如 psm=7 可能返回 10，但 psm=8 或 psm=6 可能返回 100。
+    所有结果都需要保留下来，交给上层做投票和冲突判断。
+    """
     if not os.path.isfile(TESSERACT_CMD):
         raise FileNotFoundError(
             f"找不到 OCR 程序：{TESSERACT_CMD}"
@@ -803,6 +682,7 @@ def run_tesseract_ocr(image, psm_values=(7, 8, 6, 11)):
     )
 
     if enlarged.ndim == 3:
+        # 当前项目的图像统一使用 RGB
         enlarged = cv2.cvtColor(
             enlarged,
             cv2.COLOR_RGB2GRAY,
@@ -821,6 +701,7 @@ def run_tesseract_ocr(image, psm_values=(7, 8, 6, 11)):
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
 
+    # 保证文字通常是黑字白底
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
@@ -906,6 +787,58 @@ def run_tesseract_ocr(image, psm_values=(7, 8, 6, 11)):
             except OSError:
                 pass
 
+def save_ocr_debug_image(path, image):
+    """
+    保存 OCR 调试图像。
+    """
+    if image is None or image.size == 0:
+        return
+
+    os.makedirs(
+        os.path.dirname(path),
+        exist_ok=True,
+    )
+
+    output = image
+
+    if output.dtype != np.uint8:
+        output = cv2.normalize(
+            output,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX,
+        ).astype(np.uint8)
+
+    if output.ndim == 3:
+        output = cv2.cvtColor(
+            output,
+            cv2.COLOR_RGB2BGR,
+        )
+
+    cv2.imwrite(path, output)
+
+
+def save_ocr_debug_json(path, data):
+    """
+    保存 OCR 原始文本、PSM 和解析结果。
+    """
+    os.makedirs(
+        os.path.dirname(path),
+        exist_ok=True,
+    )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 def parse_scale_value_um(ocr_text):
     normalized = ocr_text.replace("，", ",")
@@ -928,16 +861,9 @@ def parse_scale_value_um(ocr_text):
 def _collect_horizontal_scale_candidates(binary, color_priority=0):
     crop_h, crop_w = binary.shape
     kernel_width = max(7, int(round(crop_w * 0.025)))
-    horizontal_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (kernel_width, 1),
-    )
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
     opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
-    opened = cv2.morphologyEx(
-        opened,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)),
-    )
+    opened = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)))
     count, _, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
     candidates = []
     for component_id in range(1, count):
@@ -954,23 +880,8 @@ def _collect_horizontal_scale_candidates(binary, color_priority=0):
             continue
         if y <= 2 or y + height >= crop_h - 2:
             continue
-        score = (
-            float(color_priority)
-            + float(width)
-            + 0.12 * float(y)
-            + 0.04 * float(x)
-            + 0.01 * float(area)
-        )
-        candidates.append(
-            {
-                "score": score,
-                "x": x,
-                "y": y,
-                "width": width,
-                "height": height,
-                "pixels": float(width),
-            }
-        )
+        score = float(color_priority) + float(width) + 0.12 * float(y) + 0.04 * float(x) + 0.01 * float(area)
+        candidates.append({"score": score, "x": x, "y": y, "width": width, "height": height, "pixels": float(width)})
     return candidates
 
 
@@ -1006,6 +917,7 @@ def detect_scale_bar(scale_crop):
         raise ValueError("没有在图片右下区域检测到水平比例尺线段。")
     
     best = max(candidates, key=lambda item: item["score"])
+    # 强制做一次全字段 int 转换，彻底杜绝 float 传递
     return {
         "score": float(best["score"]),
         "x": int(best["x"]),
@@ -1017,6 +929,10 @@ def detect_scale_bar(scale_crop):
 
 
 def make_scale_text_regions(scale_crop, bar):
+    """
+    根据比例尺线生成多个文字 OCR 区域。
+    所有切片坐标强制转换为 int，避免 float 切片报错。
+    """
     crop_h, crop_w = scale_crop.shape[:2]
 
     x = int(bar["x"])
@@ -1063,16 +979,14 @@ def make_ocr_variants(region):
     blue = region[:, :, 2].astype(np.int16)
     red_advantage = np.clip(red - np.maximum(green, blue), 0, 255).astype(np.uint8)
     if int(np.max(red_advantage)) >= 20:
-        _, red_binary = cv2.threshold(
-            red_advantage, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
+        _, red_binary = cv2.threshold(red_advantage, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.insert(0, cv2.bitwise_not(red_binary))
     return variants
 
 
-def recognize_scale(image_rgb):
+def recognize_scale(image_rgb, debug_name=None):
     """
-    检测比例尺并使用多区域与多算法 OCR 结果进行投票判定。
+    检测比例尺并使用多个 OCR 结果进行投票。
     """
     h, w = image_rgb.shape[:2]
 
@@ -1086,6 +1000,27 @@ def recognize_scale(image_rgb):
 
     bar = detect_scale_bar(scale_crop)
 
+    if debug_name:
+        debug_stem = os.path.splitext(os.path.basename(debug_name))[0]
+    else:
+        debug_stem = "unknown_image"
+
+    debug_dir = os.path.join(OCR_DEBUG_ROOT, debug_stem)
+
+    if OCR_DEBUG_ENABLED:
+        os.makedirs(debug_dir, exist_ok=True)
+        save_ocr_debug_image(os.path.join(debug_dir, "01_scale_crop.png"), scale_crop)
+
+        bar_debug = scale_crop.copy()
+        cv2.rectangle(
+            bar_debug,
+            (int(bar["x"]), int(bar["y"])),
+            (int(bar["x"] + bar["width"]), int(bar["y"] + bar["height"])),
+            (0, 255, 0),
+            2,
+        )
+        save_ocr_debug_image(os.path.join(debug_dir, "02_detected_scale_bar.png"), bar_debug)
+
     attempts = []
     candidate_values = []
 
@@ -1093,9 +1028,22 @@ def recognize_scale(image_rgb):
 
     for region_index, region_info in enumerate(regions):
         region = region_info["image"]
+
+        if OCR_DEBUG_ENABLED:
+            save_ocr_debug_image(
+                os.path.join(debug_dir, f"region_{region_index:02d}_original.png"),
+                region,
+            )
+
         variants = make_ocr_variants(region)
 
         for variant_index, variant in enumerate(variants):
+            if OCR_DEBUG_ENABLED:
+                save_ocr_debug_image(
+                    os.path.join(debug_dir, f"region_{region_index:02d}_variant_{variant_index:02d}.png"),
+                    variant,
+                )
+
             ocr_results = run_tesseract_ocr(variant, psm_values=(7, 8, 6, 11))
 
             for ocr_result in ocr_results:
@@ -1126,6 +1074,12 @@ def recognize_scale(image_rgb):
     if not candidate_values:
         fallback_variants = make_ocr_variants(scale_crop)
         for variant_index, variant in enumerate(fallback_variants):
+            if OCR_DEBUG_ENABLED:
+                save_ocr_debug_image(
+                    os.path.join(debug_dir, f"fallback_variant_{variant_index:02d}.png"),
+                    variant,
+                )
+
             ocr_results = run_tesseract_ocr(variant, psm_values=(11, 6, 7, 8))
             for ocr_result in ocr_results:
                 text = ocr_result["text"]
@@ -1152,8 +1106,18 @@ def recognize_scale(image_rgb):
 
     if not candidate_values:
         recognized = " | ".join(item["text"] for item in attempts if item["text"]) or "<空>"
+        if OCR_DEBUG_ENABLED:
+            save_ocr_debug_json(
+                os.path.join(debug_dir, "ocr_result.json"),
+                {
+                    "bar": bar,
+                    "attempts": attempts,
+                    "candidate_values": [],
+                    "selected_value_um": None,
+                },
+            )
         raise ValueError(
-            f"OCR 未识别出比例尺数字（多方案结果：{recognized!r}）。"
+            f"OCR 未识别出比例尺数字（多方案结果：{recognized!r}）。Debug目录：{debug_dir}"
         )
 
     # 统计候选值投票数
@@ -1164,9 +1128,10 @@ def recognize_scale(image_rgb):
 
     # 按照数值从大到小排序候选值（如 100.0, 10.0）
     sorted_values = sorted(value_counts.keys(), reverse=True)
-    selected_value_um = sorted_values[0]
+    selected_value_um = sorted_values[0] # 默认选最大有效候选值
 
-    # 只要较大数值的得票率 >= 25%，说明它是完整识别的真实数值，较小数值只是笔画残缺误读
+    # 如果存在较大值（如 100）与较小值（如 10）竞价
+    # 只要较大值的得票率超过 25%，说明它是被完整识别的真实数值，较小值只是笔画残缺导致的误读
     total_votes = len(candidate_values)
     for val in sorted_values:
         if value_counts[val] / total_votes >= 0.25:
@@ -1180,6 +1145,23 @@ def recognize_scale(image_rgb):
     ]
     selected_text = selected_texts[0] if selected_texts else str(selected_value_um)
 
+    result = {
+        "bar": bar,
+        "candidate_values": candidate_values,
+        "value_counts": value_counts,
+        "selected_value_um": selected_value_um,
+        "selected_text": selected_text,
+        "scale_pixels": float(bar["pixels"]),
+        "microns_per_pixel": float(selected_value_um / bar["pixels"]),
+    }
+
+    if OCR_DEBUG_ENABLED:
+        save_ocr_debug_json(os.path.join(debug_dir, "ocr_result.json"), result)
+
+    print(
+        f"【OCR检测成功】数值: {selected_value_um:g} um | 像素长度: {bar['pixels']:.1f} px | 投票表: {value_counts}"
+    )
+
     return (
         selected_value_um / float(bar["pixels"]),
         selected_value_um,
@@ -1188,82 +1170,88 @@ def recognize_scale(image_rgb):
     )
 
 
-def measure_layer_thickness(
-    boundary_curves,
-    roi,
-    microns_per_pixel,
-    mode,
-    sample_count=50,
-):
+def measure_layer_thickness(boundary_curves, roi, microns_per_pixel, mode, sample_count=50):
     rc = boundary_curves.get("resin_ceramic")
     cb = boundary_curves.get("ceramic_bonding")
     bs = boundary_curves.get("bonding_substrate")
 
-    reference = rc if rc is not None else cb if cb is not None else bs
-    if reference is None:
+    width = len(cb) if cb is not None else len(bs) if bs is not None else 0
+    if width == 0:
         return {}
 
-    width = len(reference)
-    if roi is None:
-        x0, x1 = 0, width
-    else:
-        x0, _, x1, _ = roi
+    x0, x1 = (0, width) if roi is None else (roi[0], roi[2])
     if x1 <= x0:
         return {}
 
-    xs_sampled = np.rint(np.linspace(x0, x1 - 1, sample_count)).astype(np.int32)
-    xs_sampled = np.unique(xs_sampled)
+    xs_sampled = np.unique(np.rint(np.linspace(x0, x1 - 1, sample_count)).astype(np.int32))
+    xs_full = np.arange(x0, x1, dtype=np.int32)
 
-    if mode == "four_layer":
+    if mode == "three_layer":
+        top_zeros = np.zeros(width, dtype=np.float32)
         layer_specs = (
-            ("ceramic", "陶瓷层", rc, cb),
-            ("bonding", "粘结层", cb, bs),
-        )
-    elif mode == "three_layer":
-        layer_specs = (
-            ("bonding", "粘结层", cb, bs),
+            ("ceramic", "陶瓷层", top_zeros, cb),
+            ("bonding", "粘结层", cb, bs)
         )
     else:
-        layer_specs = ()
+        layer_specs = (
+            ("ceramic", "陶瓷层", rc, cb),
+            ("bonding", "粘结层", cb, bs)
+        )
 
     measurements = {}
     for key, display_name, upper_curve, lower_curve in layer_specs:
         if upper_curve is None or lower_curve is None:
             continue
 
-        upper_y_s = np.asarray(upper_curve[xs_sampled], dtype=np.float32)
-        lower_y_s = np.asarray(lower_curve[xs_sampled], dtype=np.float32)
+        upper_y_s, lower_y_s = upper_curve[xs_sampled], lower_curve[xs_sampled]
         gaps_px_s = lower_y_s - upper_y_s
         valid_s = np.isfinite(gaps_px_s) & (gaps_px_s > 0)
-        
-        sampled_res = None
-        if np.any(valid_s):
-            v_xs_s = xs_sampled[valid_s]
-            vals_um_s = gaps_px_s[valid_s] * float(microns_per_pixel)
-            sampled_res = {
-                "xs": v_xs_s,
+        sampled_res = (
+            {
+                "xs": xs_sampled[valid_s],
                 "upper_y": upper_y_s[valid_s],
                 "lower_y": lower_y_s[valid_s],
-                "values_um": vals_um_s,
-                "min_um": float(np.min(vals_um_s)),
-                "max_um": float(np.max(vals_um_s)),
-                "mean_um": float(np.mean(vals_um_s)),
-                "count": int(vals_um_s.size),
+                "values_um": gaps_px_s[valid_s] * float(microns_per_pixel),
+                "min_um": float(np.min(gaps_px_s[valid_s] * float(microns_per_pixel))),
+                "max_um": float(np.max(gaps_px_s[valid_s] * float(microns_per_pixel))),
+                "mean_um": float(np.mean(gaps_px_s[valid_s] * float(microns_per_pixel))),
+                "count": int(np.sum(valid_s)),
             }
+            if np.any(valid_s)
+            else None
+        )
 
-        if sampled_res:
+        upper_y_f, lower_y_f = upper_curve[xs_full], lower_curve[xs_full]
+        gaps_px_f = lower_y_f - upper_y_f
+        valid_f = np.isfinite(gaps_px_f) & (gaps_px_f > 0)
+        full_res = (
+            {
+                "xs": xs_full[valid_f],
+                "upper_y": upper_y_f[valid_f],
+                "lower_y": lower_y_f[valid_f],
+                "values_um": gaps_px_f[valid_f] * float(microns_per_pixel),
+                "min_um": float(np.min(gaps_px_f[valid_f] * float(microns_per_pixel))),
+                "max_um": float(np.max(gaps_px_f[valid_f] * float(microns_per_pixel))),
+                "mean_um": float(np.mean(gaps_px_f[valid_f] * float(microns_per_pixel))),
+                "count": int(np.sum(valid_f)),
+            }
+            if np.any(valid_f)
+            else None
+        )
+
+        if sampled_res or full_res:
             measurements[key] = {
                 "name": display_name,
                 "sampled": sampled_res,
+                "full": full_res,
                 "xs": sampled_res["xs"] if sampled_res else [],
                 "upper_y": sampled_res["upper_y"] if sampled_res else [],
                 "lower_y": sampled_res["lower_y"] if sampled_res else [],
-                "min_um": sampled_res["min_um"],
-                "max_um": sampled_res["max_um"],
-                "mean_um": sampled_res["mean_um"],
-                "count": sampled_res["count"],
+                "min_um": sampled_res["min_um"] if sampled_res else full_res["min_um"],
+                "max_um": sampled_res["max_um"] if sampled_res else full_res["max_um"],
+                "mean_um": sampled_res["mean_um"] if sampled_res else full_res["mean_um"],
+                "count": sampled_res["count"] if sampled_res else full_res["count"],
             }
-
     return measurements
 
 
@@ -1274,11 +1262,7 @@ def draw_measurement_samples(result, measurements):
         sampled_data = data.get("sampled") or data
         if not sampled_data or "xs" not in sampled_data:
             continue
-        for x, upper_y, lower_y in zip(
-            sampled_data["xs"],
-            sampled_data["upper_y"],
-            sampled_data["lower_y"],
-        ):
+        for x, upper_y, lower_y in zip(sampled_data["xs"], sampled_data["upper_y"], sampled_data["lower_y"]):
             cv2.line(
                 result,
                 (int(x), int(round(upper_y))),
@@ -1302,18 +1286,22 @@ class PredictApp:
     def __init__(self, root):
         self.root = root
         self.root.title("ResUNet34 分层划线与孔隙率识别工具")
-        self.root.geometry("1320x830")
+        self.root.geometry("1350x850")
 
         self.model = None
         self.image_path = None
         self.image_rgb = None
+        self.pred_mask = None
         self.result_rgb = None
-        self.original_photo = None
-        self.result_photo = None
+        self.boundary_curves = None
+        self.pore_mask = None
+        self.roi = None
+        self.mode = None
         self.measurements = {}
         self.pore_ratio = None
         self.pore_target_layer = None
-        self.mode = None
+
+        self.show_mask_var = tk.BooleanVar(value=True)
 
         self.status_var = tk.StringVar(value=f"设备：{DEVICE} | 请先导入图片")
         self.measurement_var = tk.StringVar(value="结果：等待处理")
@@ -1323,18 +1311,20 @@ class PredictApp:
         top = tk.Frame(self.root, padx=12, pady=10)
         top.pack(side=tk.TOP, fill=tk.X)
 
-        tk.Button(top, text="导入图片", width=14, command=self.load_image).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        tk.Button(top, text="开始处理", width=14, command=self.run_predict).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        tk.Button(top, text="保存结果", width=14, command=self.save_result).pack(
-            side=tk.LEFT, padx=(0, 16)
-        )
-        tk.Label(top, textvariable=self.status_var, anchor="w").pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
+        tk.Button(top, text="导入图片", width=12, command=self.load_image).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(top, text="开始处理", width=12, command=self.run_predict).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(top, text="保存结果", width=12, command=self.save_result).pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Checkbutton(
+            top,
+            text="叠加 Mask 掩膜对比",
+            variable=self.show_mask_var,
+            command=self.update_display_result,
+            font=("Microsoft YaHei", 10, "bold"),
+            fg="#1F4E79",
+        ).pack(side=tk.LEFT, padx=(0, 16))
+
+        tk.Label(top, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         measurement_frame = tk.LabelFrame(
             self.root,
@@ -1362,7 +1352,7 @@ class PredictApp:
         tk.Label(left_panel, text="原图", font=("Microsoft YaHei", 13, "bold")).pack()
         tk.Label(
             right_panel,
-            text="预测结果（纯分割后处理）",
+            text="预测结果（分层/划线/孔隙率）",
             font=("Microsoft YaHei", 13, "bold"),
         ).pack()
 
@@ -1384,7 +1374,10 @@ class PredictApp:
         try:
             self.image_path = path
             self.image_rgb = imread_rgb(path)
+            self.pred_mask = None
             self.result_rgb = None
+            self.boundary_curves = None
+            self.pore_mask = None
             self.measurements = {}
             self.pore_ratio = None
             self.pore_target_layer = None
@@ -1411,103 +1404,80 @@ class PredictApp:
             self.status_var.set("正在进行层分割、边界提取、孔隙率与厚度计算……")
             self.root.update_idletasks()
 
-            self.pore_ratio = None
-            self.pore_target_layer = None
-            self.measurements = {}
-            self.mode = None
-
-            pred_mask, _ = predict_outputs(self.model, self.image_rgb)
-
-            self.result_rgb, found, boundary_curves, roi, mode, class_map = draw_boundary_lines(
-                self.image_rgb,
-                pred_mask,
+            self.pred_mask = predict_outputs(self.model, self.image_rgb)
+            self.roi = detect_content_roi(self.image_rgb)
+            self.boundary_curves, self.mode, class_map = build_boundary_curves(
+                self.pred_mask, self.image_rgb, roi=self.roi
             )
-            self.mode = mode
 
-            target_layer = get_porosity_target_layer(mode)
+            target_layer = get_porosity_target_layer(self.mode)
+            self.pore_mask = None
             if target_layer is not None:
-                target_mask = build_layer_band_mask(pred_mask, boundary_curves, target_layer, class_map)
+                target_mask = build_layer_band_mask(self.pred_mask, self.boundary_curves, target_layer, class_map)
                 if target_mask is not None and cv2.countNonZero(target_mask) > 0:
                     pore_res = detect_particles_and_pores(self.image_rgb, target_mask)
                     self.pore_ratio = pore_res["pore_ratio"]
                     self.pore_target_layer = target_layer
-                    pore_mask = pore_res.get("pore_mask")
-                    if pore_mask is not None:
-                        self.result_rgb = overlay_pore_mask(
-                            self.result_rgb,
-                            pore_mask,
-                            color=(255, 215, 0),
-                            alpha=0.45,
-                        )
+                    self.pore_mask = pore_res.get("pore_mask")
 
             scale_error = None
             try:
                 um_per_pixel, scale_um, scale_pixels, _ = recognize_scale(
                     self.image_rgb,
+                    debug_name=self.image_path,
                 )
                 self.measurements = measure_layer_thickness(
-                    boundary_curves,
-                    roi,
+                    self.boundary_curves,
+                    self.roi,
                     um_per_pixel,
-                    mode,
+                    self.mode,
                     THICKNESS_SAMPLE_COUNT,
                 )
-                draw_measurement_samples(self.result_rgb, self.measurements)
-                self.show_measurements(
-                    mode,
-                    scale_um,
-                    scale_pixels,
-                    um_per_pixel,
-                )
+                self.show_measurements(self.mode, scale_um, scale_pixels, um_per_pixel)
             except Exception as exc:
                 scale_error = str(exc)
-                self.show_measurements(
-                    mode,
-                    None,
-                    None,
-                    None,
-                    scale_error=scale_error,
-                )
+                self.show_measurements(self.mode, None, None, None, scale_error=scale_error)
 
-            self.show_result()
+            self.update_display_result()
 
-            if not found:
-                self.status_var.set("处理完成，但没有提取到稳定分界线。")
-            elif mode == "unknown":
-                self.status_var.set("处理完成，但层型无法稳定判定。")
-            elif self.measurements:
-                self.status_var.set("处理完成：已完成分层划线、孔隙率统计和50点抽样厚度测量。")
-            elif scale_error:
+            if scale_error:
                 self.status_var.set("边界与孔隙率处理完成，但比例尺识别失败。")
-                messagebox.showwarning("厚度识别失败", scale_error)
             else:
-                self.status_var.set("处理完成。")
+                self.status_var.set("处理完成：已完成分层划线、Mask对比叠加与统计。")
         except Exception as exc:
             messagebox.showerror("预测失败", str(exc))
-            self.status_var.set("预测失败，请检查模型权重、输入图像及配置。")
+            self.status_var.set("预测失败，请检查模型权重及输入图像。")
 
-    def show_measurements(
-        self,
-        mode,
-        scale_um,
-        scale_pixels,
-        um_per_pixel,
-        scale_error=None,
-    ):
+    def update_display_result(self):
+        if self.image_rgb is None or self.boundary_curves is None:
+            return
+
+        if self.show_mask_var.get() and self.pred_mask is not None:
+            base_canvas = overlay_segmentation_mask(self.image_rgb, self.pred_mask, alpha=0.35)
+        else:
+            base_canvas = self.image_rgb.copy()
+
+        self.result_rgb, _ = draw_boundary_lines_on_image(base_canvas, self.boundary_curves)
+
+        if self.pore_mask is not None:
+            self.result_rgb = overlay_pore_mask(self.result_rgb, self.pore_mask, color=(255, 215, 0), alpha=0.45)
+
+        if self.measurements:
+            draw_measurement_samples(self.result_rgb, self.measurements)
+
+        self.show_result()
+
+    def show_measurements(self, mode, scale_um, scale_pixels, um_per_pixel, scale_error=None):
         lines = []
-
         if mode == "four_layer":
-            lines.append("层型判定：4 层（0,1,2,3）")
+            lines.append("层型判定：4 层 (0:树脂, 1:陶瓷, 2:粘结, 3:基体)")
         elif mode == "three_layer":
-            lines.append("层型判定：3 层（1,2,3）")
+            lines.append("层型判定：3 层 (1:陶瓷, 2:粘结, 3:基体)")
         else:
             lines.append("层型判定：未知")
 
         if scale_error is None and scale_um is not None:
-            lines.append(
-                f"比例尺：{scale_um:g} um = {scale_pixels:.1f} px；"
-                f"换算系数：{um_per_pixel:.6f} um/px"
-            )
+            lines.append(f"比例尺：{scale_um:g} um = {scale_pixels:.1f} px；换算系数：{um_per_pixel:.6f} um/px")
         else:
             lines.append(f"比例尺换算失败：{scale_error}")
 
@@ -1515,28 +1485,23 @@ class PredictApp:
         bonding = self.measurements.get("bonding")
 
         if ceramic is not None:
-            s = ceramic.get("sampled")
+            s, f = ceramic.get("sampled"), ceramic.get("full")
             lines.append(f"【{ceramic['name']}厚度】")
             if s:
                 lines.append(f"  · 抽样{s['count']}点: 平均 {s['mean_um']:.3f} um (最小 {s['min_um']:.3f} | 最大 {s['max_um']:.3f})")
-        elif mode == "four_layer":
-            lines.append("陶瓷层厚度：缺少红线或绿线，无法计算。")
-        else:
-            lines.append("陶瓷层厚度：当前 3 层规则下不计算。")
+            if f:
+                lines.append(f"  · 逐列全样({f['count']}列): 平均 {f['mean_um']:.3f} um (最小 {f['min_um']:.3f} | 最大 {f['max_um']:.3f})")
 
         if bonding is not None:
-            s = bonding.get("sampled")
+            s, f = bonding.get("sampled"), bonding.get("full")
             lines.append(f"【{bonding['name']}厚度】")
             if s:
                 lines.append(f"  · 抽样{s['count']}点: 平均 {s['mean_um']:.3f} um (最小 {s['min_um']:.3f} | 最大 {s['max_um']:.3f})")
-        else:
-            lines.append("粘结层厚度：缺少绿线或蓝线，无法计算。")
+            if f:
+                lines.append(f"  · 逐列全样({f['count']}列): 平均 {f['mean_um']:.3f} um (最小 {f['min_um']:.3f} | 最大 {f['max_um']:.3f})")
 
         if self.pore_ratio is not None:
-            target_name = "陶瓷层" if self.pore_target_layer == "ceramic" else "粘结层"
-            lines.append(f"{target_name}孔隙率：{self.pore_ratio:.2f}%")
-        else:
-            lines.append("孔隙率：未获得有效目标层区域，无法计算。")
+            lines.append(f"陶瓷层孔隙率：{self.pore_ratio:.2f}%")
 
         self.measurement_var.set("\n".join(lines))
 
@@ -1552,11 +1517,7 @@ class PredictApp:
             title="保存预测结果",
             defaultextension=".png",
             initialfile=default_name,
-            filetypes=[
-                ("PNG Image", "*.png"),
-                ("JPEG Image", "*.jpg"),
-                ("All Files", "*.*"),
-            ],
+            filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")],
         )
         if not path:
             return

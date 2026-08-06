@@ -30,3 +30,6 @@ data/
 outputs/
 results/
 temp/
+
+# assets 中的测试图片文件夹（只保留顶层 demo 截图）
+assets/*/

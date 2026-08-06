@@ -129,29 +129,17 @@ def layer_summary(data):
     if data is None:
         return "未识别"
     
-    # 获取两种测厚逻辑的数据
+
     s_data = data.get("sampled")
-    f_data = data.get("full")
     
     lines = []
     if s_data:
         lines.append(
             f"[抽样50点] 平均:{s_data['mean_um']:.3f} um (范围:{s_data['min_um']:.3f}~{s_data['max_um']:.3f})"
         )
-    if f_data:
-        lines.append(
-            f"[逐列全样] 平均:{f_data['mean_um']:.3f} um (范围:{f_data['min_um']:.3f}~{f_data['max_um']:.3f})"
-        )
     
     if lines:
         return "\n".join(lines)
-    
-    # 兼容备用
-    return (
-        f"最小值：{data['min_um']:.3f} um\n"
-        f"最大值：{data['max_um']:.3f} um\n"
-        f"平均值：{data['mean_um']:.3f} um"
-    )
 
 
 def get_porosity_label(record):
